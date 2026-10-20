@@ -349,13 +349,19 @@ export default function Emergency() {
       if (res && res.success && Array.isArray(res.data)) {
         const mapped = mapBackendHospitalsList(res.data, HOSPITALS, city);
         setSelectableHospitals(mapped);
+        const allIds = mapped.map(getHospitalBackendId).filter(Boolean);
+        setSelectedHospitalIds(allIds);
       } else {
         const fallback = mapBackendHospitalsList(null, HOSPITALS, city);
         setSelectableHospitals(fallback);
+        const allIds = fallback.map(getHospitalBackendId).filter(Boolean);
+        setSelectedHospitalIds(allIds);
       }
     } catch {
       const fallback = mapBackendHospitalsList(null, HOSPITALS, city);
       setSelectableHospitals(fallback);
+      const allIds = fallback.map(getHospitalBackendId).filter(Boolean);
+      setSelectedHospitalIds(allIds);
     } finally {
       setIsLoadingHospitals(false);
     }

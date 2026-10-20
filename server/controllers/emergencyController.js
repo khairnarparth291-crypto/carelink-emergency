@@ -158,9 +158,6 @@ export const createEmergencyRequest = async (req, res, next) => {
       targetHospitalIds = hospitalIds;
     } else if (hospitalId) {
       targetHospitalIds = [hospitalId];
-    } else if (Array.isArray(hospitalIds) && hospitalIds.length === 0) {
-      // Unassigned initially: hospitals will be selected in the dispatch step
-      targetHospitalIds = [];
     } else {
       // Auto-dispatch to network emergency hospitals matching patient location
       const locAddress = typeof location === "object" && location !== null
@@ -185,16 +182,13 @@ export const createEmergencyRequest = async (req, res, next) => {
 
       if (cityMatches.length > 0) {
         targetHospitalIds = cityMatches.map((h) => String(h._id || h.id));
-      } else if (!locStr) {
-        // Default only when no location was specified at all
+      } else {
+        // Default to Pune emergency casualty network (Care Hospital Pune, Apollo Care, Ruby Metro)
         targetHospitalIds = [
           "670100000000000000000010",
           "670100000000000000000020",
           "670100000000000000000030"
         ];
-      } else {
-        // Specified city has no registered casualty network; do not auto-dispatch to Pune
-        targetHospitalIds = [];
       }
     }
 
@@ -202,8 +196,9 @@ export const createEmergencyRequest = async (req, res, next) => {
     const now = new Date();
     for (const hid of targetHospitalIds) {
       const details = getHospitalDetails(hid);
+      const isOid = mongoose.Types.ObjectId.isValid(details.hospitalId);
       initialResponses.push({
-        hospitalId: details.hospitalId,
+        hospitalId: isOid ? new mongoose.Types.ObjectId(details.hospitalId) : details.hospitalId,
         hospitalName: details.hospitalName,
         hospitalPhone: details.hospitalPhone,
         hospitalEmergencyPhone: details.hospitalEmergencyPhone,
@@ -215,6 +210,10 @@ export const createEmergencyRequest = async (req, res, next) => {
         updatedAt: now.toISOString ? now.toISOString() : now
       });
     }
+
+    const primaryHospitalId = targetHospitalIds[0] && mongoose.Types.ObjectId.isValid(targetHospitalIds[0])
+      ? new mongoose.Types.ObjectId(targetHospitalIds[0])
+      : (targetHospitalIds[0] || null);
 
     if (isMongoDBConnected()) {
       try {
@@ -232,7 +231,7 @@ export const createEmergencyRequest = async (req, res, next) => {
           reportedComplaint: reportedComplaint || null,
           suggestedSpecialist: suggestedSpecialist || null,
           requiredBedType: requiredBedType || "Normal",
-          hospitalId: targetHospitalIds[0] || null,
+          hospitalId: primaryHospitalId,
           status: "PENDING",
           message: message || "",
           contactPhone: contactPhone || "",
@@ -242,6 +241,24 @@ export const createEmergencyRequest = async (req, res, next) => {
           insurance: insurance || "",
           hospitalResponses: initialResponses
         });
+
+        // Real-Time Notification: Emit dispatch to each recipient hospital desk
+        for (const hid of targetHospitalIds) {
+          emitNewEmergencyRequestDispatched(String(hid), {
+            requestId: String(newRequest._id || newRequest.id),
+            id: String(newRequest.id || newRequest._id),
+            patientName: newRequest.patientName,
+            patientAge: newRequest.patientAge,
+            patientGender: newRequest.patientGender,
+            emergencyType: newRequest.emergencyType,
+            requiredFacility: newRequest.requiredFacility,
+            requiredSpecialist: newRequest.requiredSpecialist,
+            location: newRequest.location,
+            estimatedArrival: newRequest.estimatedArrival,
+            status: "PENDING",
+            createdAt: newRequest.createdAt
+          });
+        }
 
         return res.status(201).json({
           success: true,
@@ -271,7 +288,7 @@ export const createEmergencyRequest = async (req, res, next) => {
       reportedComplaint: reportedComplaint || null,
       suggestedSpecialist: suggestedSpecialist || null,
       requiredBedType: requiredBedType || "Normal",
-      hospitalId: targetHospitalIds[0] || null,
+      hospitalId: primaryHospitalId,
       status: "PENDING",
       message: message || "",
       contactPhone: contactPhone || "",
@@ -289,6 +306,24 @@ export const createEmergencyRequest = async (req, res, next) => {
     };
 
     mockStore.emergencyRequests.unshift(newReq);
+
+    // Real-Time Notification: Emit dispatch to each recipient hospital desk
+    for (const hid of targetHospitalIds) {
+      emitNewEmergencyRequestDispatched(String(hid), {
+        requestId: String(newReq._id || newReq.id),
+        id: String(newReq.id || newReq._id),
+        patientName: newReq.patientName,
+        patientAge: newReq.patientAge,
+        patientGender: newReq.patientGender,
+        emergencyType: newReq.emergencyType,
+        requiredFacility: newReq.requiredFacility,
+        requiredSpecialist: newReq.requiredSpecialist,
+        location: newReq.location,
+        estimatedArrival: newReq.estimatedArrival,
+        status: "PENDING",
+        createdAt: newReq.createdAt
+      });
+    }
 
     res.status(201).json({
       success: true,
@@ -548,6 +583,19 @@ export const dispatchEmergencyRequest = async (req, res, next) => {
           updatedAt: now.toISOString ? now.toISOString() : now
         };
         request.hospitalResponses.push(info);
+      }
+    }
+
+    if (!request.hospitalId && validHospitals.length > 0) {
+      const primaryRec = validHospitals[0].record;
+      const primaryId = primaryRec._id || primaryRec.id || validHospitals[0].id;
+      if (mongoose.Types.ObjectId.isValid(primaryId)) {
+        request.hospitalId = new mongoose.Types.ObjectId(primaryId);
+      } else {
+        request.hospitalId = primaryId;
+      }
+      if (request.markModified) {
+        request.markModified("hospitalId");
       }
     }
 
@@ -1068,14 +1116,44 @@ export const getEmergencyRequests = async (req, res, next) => {
     if (isMongoDBConnected()) {
       try {
         const isObjectId = mongoose.Types.ObjectId.isValid(hospitalId);
+        const objId = isObjectId ? new mongoose.Types.ObjectId(hospitalId) : null;
         const idVariants = isObjectId
-          ? [hospitalId, new mongoose.Types.ObjectId(hospitalId)]
-          : [hospitalId];
+          ? [hospitalId, objId, String(hospitalId)]
+          : [hospitalId, String(hospitalId)];
+
+        const hospRecord = await findHospitalRecord(hospitalId);
+        const hospCity = hospRecord?.city ? String(hospRecord.city).split(",")[0].trim() : "";
+
+        // Unassigned requests fallback: only included if the querying hospital has a verified city (>= 3 chars)
+        // and strictly matches the patient's specified location for that same city.
+        const unassignedCityFallback = (hospCity && hospCity.length >= 3)
+          ? [
+              {
+                $and: [
+                  {
+                    $or: [
+                      { hospitalId: null },
+                      { hospitalId: { $exists: false } },
+                      { hospitalResponses: { $size: 0 } },
+                      { hospitalResponses: { $exists: false } }
+                    ]
+                  },
+                  {
+                    $or: [
+                      { "location.address": new RegExp(`(^|\\b|\\s|,)${hospCity}(\\b|\\s|,|$)`, "i") },
+                      { location: new RegExp(`(^|\\b|\\s|,)${hospCity}(\\b|\\s|,|$)`, "i") }
+                    ]
+                  }
+                ]
+              }
+            ]
+          : [];
 
         const query = {
           $or: [
             { "hospitalResponses.hospitalId": { $in: idVariants } },
-            { hospitalId: { $in: idVariants } }
+            { hospitalId: { $in: idVariants } },
+            ...unassignedCityFallback
           ]
         };
 
@@ -1090,8 +1168,8 @@ export const getEmergencyRequests = async (req, res, next) => {
           const hospEntry = r.hospitalResponses?.find(
             (hr) => String(hr.hospitalId) === String(hospitalId)
           );
+          const doc = r.toObject ? r.toObject() : { ...r };
           if (hospEntry) {
-            const doc = r.toObject ? r.toObject() : r;
             return {
               ...doc,
               status: hospEntry.responseStatus,
@@ -1101,7 +1179,12 @@ export const getEmergencyRequests = async (req, res, next) => {
               responseNote: hospEntry.responseNote
             };
           }
-          return r.toObject ? r.toObject() : r;
+          return {
+            ...doc,
+            status: doc.status || "PENDING",
+            rawStatus: doc.status || "PENDING",
+            responseStatus: doc.status || "PENDING"
+          };
         });
 
         let filtered = mapped;
@@ -1121,6 +1204,11 @@ export const getEmergencyRequests = async (req, res, next) => {
 
     // Memory Store Fallback
     const targetHospIdStr = String(hospitalId);
+    const mockHosp = mockStore.hospitals.find(
+      (h) => String(h._id) === targetHospIdStr || String(h.id) === targetHospIdStr
+    );
+    const mockCity = (mockHosp?.city || "Pune").toLowerCase();
+
     let requests = mockStore.emergencyRequests.filter((r) => {
       const hasResponse = r.hospitalResponses?.some(
         (hr) => String(hr.hospitalId) === targetHospIdStr
@@ -1128,6 +1216,15 @@ export const getEmergencyRequests = async (req, res, next) => {
       if (hasResponse) return true;
       if (r.hospitalId && String(r.hospitalId) === targetHospIdStr) {
         return true;
+      }
+      const isUnassigned =
+        (!r.hospitalId || r.hospitalId === null) &&
+        (!r.hospitalResponses || r.hospitalResponses.length === 0);
+      if (isUnassigned) {
+        const locStr = typeof r.location === "object" ? (r.location?.address || "") : (r.location || "");
+        if (!locStr || locStr.toLowerCase().includes(mockCity)) {
+          return true;
+        }
       }
       return false;
     });
@@ -1146,7 +1243,12 @@ export const getEmergencyRequests = async (req, res, next) => {
           responseNote: hospEntry.responseNote
         };
       }
-      return r;
+      return {
+        ...r,
+        status: r.status || "PENDING",
+        rawStatus: r.status || "PENDING",
+        responseStatus: r.status || "PENDING"
+      };
     });
 
     let filtered = mapped;

@@ -157,6 +157,30 @@ export function HospitalPortalProvider({ children }) {
     }
   }, [activeHospitalId]);
 
+  // Synchronize activeHospitalId with authenticated hospital user's assigned hospital
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    const token = getToken();
+    if (!token) return;
+
+    api.getMe()
+      .then((res) => {
+        const tokenHospitalId = res?.data?.user?.hospitalId;
+        if (tokenHospitalId && /^[0-9a-fA-F]{24}$/.test(String(tokenHospitalId))) {
+          if (String(tokenHospitalId) !== String(activeHospitalId)) {
+            setActiveHospitalId(String(tokenHospitalId));
+          }
+        }
+      })
+      .catch((err) => {
+        if (err?.status === 401) {
+          removeToken();
+          setIsAuthenticated(false);
+        }
+      });
+  }, [isAuthenticated, activeHospitalId]);
+
+
   const [isLoading, setIsLoading] = useState(false);
   const [isBackendConnected, setIsBackendConnected] = useState(false);
   const [backendError, setBackendError] = useState(null);
